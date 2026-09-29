@@ -1,0 +1,41 @@
+=== SECTION: ARCH_01 ===
+SYSTEM ARCHITECTURE OVERVIEW
+CloudScale Core is built on a distributed microservices pattern deployed across Kubernetes clusters in two primary regions: us-east-1 (Primary) and eu-central-1 (Secondary). Incoming client traffic terminates at an NGINX API Gateway, which handles SSL termination, rate limiting via token bucket algorithms, and JWT validation. Internal service-to-service communication relies on gRPC for low-latency synchronous calls and Apache Kafka for asynchronous event propagation. State is persisted across three tiers: PostgreSQL handles relational transaction records, Redis manages distributed caching and session state, and Amazon S3 stores raw binary telemetry data and document attachments.
+
+=== SECTION: AUTH_02 ===
+AUTHENTICATION AND RBAC POLICIES
+User authentication utilizes OAuth 2.0 with OIDC tokens issued by the internal identity service. Access tokens expire after 60 minutes, while refresh tokens remain valid for 14 days with sliding-window revocation. Role-Based Access Control (RBAC) enforces four primary tiers: Viewer (read-only telemetry and dashboard access), Operator (deployment execution, cache eviction, and log streaming), Admin (user provisioning, key rotation, and policy modification), and ServiceAccount (machine-to-machine mutual TLS authentication). Any permission check returning HTTP 403 must be inspected against the user's role mapping cached in Redis key namespace `auth:roles:{user_id}`.
+
+=== SECTION: DB_03 ===
+POSTGRESQL DATABASE REPLICATION AND FAILOVER
+The PostgreSQL cluster runs version 16 using physical streaming replication with one primary node and two read replicas across distinct availability zones. The replication mode is synchronous-commit between the primary and the first replica to prevent data loss. Failover orchestration is automated via Patroni with Consul for distributed consensus. If Patroni detects a network partition or primary health check failure lasting longer than 15 seconds, it initiates leader election. Applications connect through PgBouncer connection pools configured in transaction mode, capped at 150 client connections per pod.
+
+=== SECTION: KAFKA_04 ===
+KAFKA EVENT PIPELINE AND CONSUMER GROUPS
+Asynchronous workflows, including billing reconciliation and audit logging, stream through Kafka clusters running 12 partitions per topic with a replication factor of 3. Producers must specify `acks=all` and enable idempotent delivery to avoid duplicate ledger entries. The billing service belongs to the consumer group `billing-ledger-workers`. When lag on `billing-ledger-workers` exceeds 5,000 messages for over 5 minutes, an alert triggers autoscaling via KEDA to increment consumer pods up to a maximum of 12 (matching the partition ceiling).
+
+=== SECTION: API_05 ===
+API GATEWAY RATE LIMITING AND HEADERS
+The NGINX API Gateway applies tiered rate limiting using Redis as a distributed leaky-bucket counter. Default public API endpoints are restricted to 100 requests per minute (RPM) per API key. Enterprise tier accounts receive 1,000 RPM. When a client exceeds their quota, the gateway immediately returns HTTP 429 Too Many Requests along with three informational headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` (in integer seconds). System-internal health check probes bypassing rate limits must hit `/healthz` on port 8081 over the internal cluster network.
+
+=== SECTION: TS_06 ===
+TROUBLESHOOTING: DATABASE TIMEOUT AND POOL EXHAUSTION
+When applications log `NpgsqlException: Timeout during connection acquisition`, investigate PgBouncer first. Common root causes include unindexed queries holding active connections or unclosed transactions leaking from background workers. Run `SHOW POOLS` and `SHOW CLIENTS` via the PgBouncer administrative console on port 6432. If `active_clients` equals `max_client_conn`, identify the longest-running queries in PostgreSQL using:
+`SELECT pid, now() - pg_stat_activity.query_start AS duration, query, state FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 5;`
+Cancel rogue queries causing starvation using `SELECT pg_cancel_backend(pid);`.
+
+=== SECTION: TS_07 ===
+TROUBLESHOOTING: KAFKA CONSUMER REBALANCING LOOPS
+A high rebalance rate in Kafka occurs when a consumer takes longer to process a batch of records than the configured `max.poll.interval.ms` (default: 300,000 ms), causing the coordinator to assume the worker died. Diagnostic indicators include repeated `CommitFailedException` errors and consumer lag spikes across all partitions. To remediate: reduce `max.poll.records` in the worker configuration from 500 down to 50, ensure heavy I/O operations inside consumer loops use bounded timeouts, and verify worker memory metrics to rule out Stop-The-World Java Virtual Machine (JVM) garbage collection pauses.
+
+=== SECTION: SEC_08 ===
+SECRET MANAGEMENT AND CREDENTIAL ROTATION
+All production secrets, database credentials, and third-party API keys are stored in HashiCorp Vault. Pods retrieve credentials dynamically during startup via the Vault CSI Provider driver mounted at `/etc/secrets`. Secrets are rotated automatically every 90 days. For emergency rotation following a credential leak, administrators must trigger the pipeline `ops-cli vault rotate --target=<secret_path>`, which invalidates existing leases, injects updated credentials into Vault, and issues a rolling restart across all dependent Kubernetes deployments.
+
+=== SECTION: BACKUP_09 ===
+DISASTER RECOVERY AND BACKUP SPECIFICATIONS
+Backups are orchestrated via daily snapshot automation and continuous write-ahead log (WAL) archiving. PostgreSQL WAL files are pushed to an encrypted S3 bucket every 60 seconds using `pgBackRest`, ensuring a Recovery Point Objective (RPO) of under 2 minutes. Full database snapshots execute nightly at 02:00 UTC. The Recovery Time Objective (RTO) for total regional failover from us-east-1 to eu-central-1 is 45 minutes, validated quarterly through automated sandbox restoration drills.
+
+=== SECTION: DEP_10 ===
+DEPLOYMENT WORKFLOW AND CANARY ROLLOUTS
+Service deployments follow a progressive delivery model using Argo Rollouts. New container images are deployed initially to a Canary track receiving 10% of production traffic for 15 minutes. During this observation window, Prometheus monitors the HTTP 5xx error rate and p99 latency metrics. If the error rate remains under 0.1% and p99 latency stays below 250 ms, the rollout automatically scales to 50%, then 100%. If metrics breach safety thresholds, Argo triggers an automated rollback to the preceding stable revision within 30 seconds.
