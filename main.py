@@ -30,7 +30,7 @@ def main():
     load_dotenv()
     client = genai.Client() 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents = (
             "What is the default RPM limit for Enterprise accounts at the API gateway, "
             "and if a client has 2 enterprise keys, what is their combined total RPM?"
